@@ -63,19 +63,38 @@ export default function Monitor() {
     }
   };
 
-  const loadRange = async (dId, _rangeKey) => {
+  // Carga histórico para el rango actual.
+  // NOTA: No limpiamos la serie antes de cargar, para evitar "pantallazos en blanco" al cambiar de tab.
+  const loadRange = async (dId, rangeKey) => {
     if (!dId) return;
+
+    const now = new Date();
+    const range = ranges.find((r) => r.key === rangeKey) ?? ranges[0];
+    const since = new Date(now.getTime() - range.ms);
+
+    setLoading(true);
     try {
-      setLoading(true);
       const { data } = await api.get("/api/readings", {
-        params: { deviceId: dId, limit: 1000, order: "asc" },
+        // el backend acepta since + until (alias de to)
+        params: {
+          deviceId: dId,
+          since: since.toISOString(),
+          until: now.toISOString(),
+          order: "asc",
+          limit:
+            rangeKey === "1h"
+              ? 1200 // hasta ~1 muestra/3s durante 1h
+              : 5000, // 24h y 7d: máximo permitido por tu controlador
+        },
       });
 
-      // Soportar tanto [] como { rows: [] }
+      // Soportar [] | { rows: [] } | { data: [] }
       const arr = Array.isArray(data)
         ? data
         : Array.isArray(data?.rows)
         ? data.rows
+        : Array.isArray(data?.data)
+        ? data.data
         : [];
 
       const rows = arr.map((r) => ({
@@ -85,24 +104,16 @@ export default function Monitor() {
         pm25: r.pm25,
         pm10: r.pm10,
       }));
+
       setSeries(rows);
     } catch (e) {
-      if (
-        e?.response?.status === 403 &&
-        e?.response?.data?.error === "DEVICE_INACTIVE"
-      ) {
-        enqueueSnackbar("El dispositivo está inactivo.", { variant: "warning" });
-        // Re-sincroniza selección a un activo
-        await loadActiveDevices();
-      } else {
-        const msg =
-          e?.response?.data?.message ||
-          e?.response?.data?.error ||
-          e?.message ||
-          "Error al cargar lecturas";
-        enqueueSnackbar(msg, { variant: "error" });
-      }
-      setSeries([]);
+      const msg =
+        e?.response?.data?.message ||
+        e?.response?.data?.error ||
+        e?.message ||
+        "Error al cargar lecturas";
+      enqueueSnackbar(msg, { variant: "error" });
+      // No limpiamos series aquí para que el usuario no pierda el gráfico visible.
     } finally {
       setLoading(false);
     }
@@ -120,11 +131,12 @@ export default function Monitor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deviceId, tab]);
 
-  // Actualizaciones en vivo solo en "Última hora"
+  // Actualizaciones en vivo SOLO en "Última hora"
   useSocket({
     "reading:new": (payload) => {
+      if (tab !== "1h") return; // ← sockets solo para 1h
       if (!payload || String(payload.deviceId) !== String(deviceId)) return;
-      if (tab !== "1h") return;
+
       const p = {
         time: new Date(payload.createdAt || Date.now()).toLocaleTimeString(),
         temperature: payload.temperature,
@@ -132,12 +144,17 @@ export default function Monitor() {
         pm25: payload.pm25,
         pm10: payload.pm10,
       };
-      setSeries((prev) => [...prev.slice(-599), p]);
+      // mantiene ~1200 puntos en 1h
+      setSeries((prev) => [...prev.slice(-1199), p]);
     },
   });
 
   const options = useMemo(
-    () => (Array.isArray(devices) ? devices : []).map((d) => ({ id: d.id, name: d.name })),
+    () =>
+      (Array.isArray(devices) ? devices : []).map((d) => ({
+        id: d.id,
+        name: d.name,
+      })),
     [devices]
   );
 
